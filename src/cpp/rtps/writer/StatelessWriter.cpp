@@ -40,6 +40,48 @@ namespace eprosima {
 namespace fastrtps {
 namespace rtps {
 
+static bool add_change_to_rtps_group(
+        RTPSMessageGroup& group,
+        ChangeForReader_t* reader_change,
+        bool inline_qos)
+{
+    try
+    {
+        CacheChange_t* change = reader_change->getChange();
+        if (change->getFragmentSize() > 0)
+        {
+            reader_change->getUnsentFragments().for_each(
+                [&group, change, inline_qos, reader_change](
+                    FragmentNumber_t frag)
+                {
+                    if (group.add_data_frag(*change, frag, inline_qos))
+                    {
+                        reader_change->markFragmentsAsSent(frag);
+                    }
+                    else
+                    {
+                        logError(RTPS_WRITER, "Error sending fragment ("
+                            << change->sequenceNumber << ", " << frag << ")");
+                    }
+                });
+        }
+        else
+        {
+            if (!group.add_data(*change, inline_qos))
+            {
+                logError(RTPS_WRITER, "Error sending change " << change->sequenceNumber);
+            }
+        }
+    }
+    catch (const RTPSMessageGroup::timeout&)
+    {
+        logError(RTPS_WRITER, "Max blocking time reached");
+        return false;
+    }
+
+    return true;
+}
+
 StatelessWriter::StatelessWriter(
         RTPSParticipantImpl* participant,
         GUID_t& guid,
@@ -355,8 +397,71 @@ void StatelessWriter::update_unsent_changes(
 
 void StatelessWriter::send_any_unsent_changes()
 {
-    //TODO(Mcc) Separate sending for asynchronous writers
     std::lock_guard<RecursiveTimedMutex> guard(mp_mutex);
+
+    bool remote_destinations = there_are_remote_readers_ || !fixed_locators_.empty();
+    bool no_flow_controllers = flow_controllers_.empty() && mp_RTPSParticipant->getFlowControllers().empty();
+    if (!remote_destinations || no_flow_controllers)
+    {
+        send_all_unsent_changes();
+    }
+    else
+    {
+        send_unsent_changes_with_flow_control();
+    }
+
+    logInfo(RTPS_WRITER, "Finish sending unsent changes");
+}
+
+void StatelessWriter::send_all_unsent_changes()
+{
+    //TODO(Mcc) Separate sending for asynchronous writers
+
+    RTPSMessageGroup group(mp_RTPSParticipant, this, *this);
+    bool remote_destinations = there_are_remote_readers_ || !fixed_locators_.empty();
+    bool bHasListener = mp_listener != nullptr;
+
+    while (!unsent_changes_.empty())
+    {
+        ChangeForReader_t& unsentChange = unsent_changes_.front();
+        CacheChange_t* cache_change = unsentChange.getChange();
+
+        uint64_t sequence_number = cache_change->sequenceNumber.to64long();
+        // Filter intraprocess unsent changes
+        if (sequence_number > last_intraprocess_sequence_number_)
+        {
+            last_intraprocess_sequence_number_ = sequence_number;
+            for (ReaderLocator& it : matched_readers_)
+            {
+                if (it.is_local_reader())
+                {
+                    intraprocess_delivery(cache_change, it);
+                }
+            }
+        }
+
+        if (remote_destinations)
+        {
+            if(!add_change_to_rtps_group(group, &unsentChange, is_inline_qos_expected_))
+            {
+                break;
+            }
+        }
+
+        unsent_changes_.erase(unsent_changes_.begin());
+        if (bHasListener)
+        {
+            mp_listener->onWriterChangeReceivedByAll(this, cache_change);
+        }
+    }
+}
+
+void StatelessWriter::send_unsent_changes_with_flow_control()
+{
+    //TODO(Mcc) Separate sending for asynchronous writers
+
+    // There should be remote destinations
+    assert(there_are_remote_readers_ || !fixed_locators_.empty());
 
     RTPSWriterCollector<ReaderLocator*> changesToSend;
 
@@ -380,66 +485,62 @@ void StatelessWriter::send_any_unsent_changes()
         }
     }
 
-    if (there_are_remote_readers_ || !fixed_locators_.empty())
+    bool bHasListener = mp_listener != nullptr;
+
+    // Clear through local controllers
+    for (auto& controller : flow_controllers_)
     {
-        // Clear through local controllers
-        for (auto& controller : flow_controllers_)
-        {
-            (*controller)(changesToSend);
-        }
-
-        // Clear through parent controllers
-        for (auto& controller : mp_RTPSParticipant->getFlowControllers())
-        {
-            (*controller)(changesToSend);
-        }
-
-        try
-        {
-            RTPSMessageGroup group(mp_RTPSParticipant, this, *this);
-
-            bool bHasListener = mp_listener != nullptr;
-            while (!changesToSend.empty())
-            {
-                RTPSWriterCollector<ReaderLocator*>::Item changeToSend = changesToSend.pop();
-
-                // Remove the messages selected for sending from the original list,
-                // and update those that were fragmented with the new sent index
-                update_unsent_changes(changeToSend.sequenceNumber, changeToSend.fragmentNumber);
-
-                // Notify the controllers
-                FlowController::NotifyControllersChangeSent(changeToSend.cacheChange);
-
-                if (changeToSend.fragmentNumber != 0)
-                {
-                    if (!group.add_data_frag(*changeToSend.cacheChange, changeToSend.fragmentNumber,
-                        is_inline_qos_expected_))
-                    {
-                        logError(RTPS_WRITER, "Error sending fragment (" << changeToSend.sequenceNumber <<
-                            ", " << changeToSend.fragmentNumber << ")");
-                    }
-                }
-                else
-                {
-                    if (!group.add_data(*changeToSend.cacheChange, is_inline_qos_expected_))
-                    {
-                        logError(RTPS_WRITER, "Error sending change " << changeToSend.sequenceNumber);
-                    }
-                }
-
-                if (bHasListener && is_acked_by_all(changeToSend.cacheChange))
-                {
-                    mp_listener->onWriterChangeReceivedByAll(this, changeToSend.cacheChange);
-                }
-            }
-        }
-        catch (const RTPSMessageGroup::timeout&)
-        {
-            logError(RTPS_WRITER, "Max blocking time reached");
-        }
+        (*controller)(changesToSend);
     }
 
-    logInfo(RTPS_WRITER, "Finish sending unsent changes");
+    // Clear through parent controllers
+    for (auto& controller : mp_RTPSParticipant->getFlowControllers())
+    {
+        (*controller)(changesToSend);
+    }
+
+    try
+    {
+        RTPSMessageGroup group(mp_RTPSParticipant, this, *this);
+
+        while (!changesToSend.empty())
+        {
+            RTPSWriterCollector<ReaderLocator*>::Item changeToSend = changesToSend.pop();
+
+            // Remove the messages selected for sending from the original list,
+            // and update those that were fragmented with the new sent index
+            update_unsent_changes(changeToSend.sequenceNumber, changeToSend.fragmentNumber);
+
+            // Notify the controllers
+            FlowController::NotifyControllersChangeSent(changeToSend.cacheChange);
+
+            if (changeToSend.fragmentNumber != 0)
+            {
+                if (!group.add_data_frag(*changeToSend.cacheChange, changeToSend.fragmentNumber,
+                    is_inline_qos_expected_))
+                {
+                    logError(RTPS_WRITER, "Error sending fragment (" << changeToSend.sequenceNumber <<
+                        ", " << changeToSend.fragmentNumber << ")");
+                }
+            }
+            else
+            {
+                if (!group.add_data(*changeToSend.cacheChange, is_inline_qos_expected_))
+                {
+                    logError(RTPS_WRITER, "Error sending change " << changeToSend.sequenceNumber);
+                }
+            }
+
+            if (bHasListener && is_acked_by_all(changeToSend.cacheChange))
+            {
+                mp_listener->onWriterChangeReceivedByAll(this, changeToSend.cacheChange);
+            }
+        }
+    }
+    catch (const RTPSMessageGroup::timeout&)
+    {
+        logError(RTPS_WRITER, "Max blocking time reached");
+    }
 }
 
 /*
