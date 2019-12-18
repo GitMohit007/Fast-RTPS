@@ -32,8 +32,6 @@ namespace eprosima {
 namespace fastrtps {
 namespace rtps {
 
-static thread_local std::unique_ptr<RTPSMessageGroup_t> tls_group;
-
 bool sort_changes_group (CacheChange_t* c1,CacheChange_t* c2)
 {
     return(c1->sequenceNumber < c2->sequenceNumber);
@@ -156,6 +154,7 @@ RTPSMessageGroup::RTPSMessageGroup(
     , encrypt_msg_(nullptr)
 #endif
     , max_blocking_time_point_(max_blocking_time_point)
+    , send_buffer_(participant->get_send_buffer())
 {
     // Avoid warning when neither SECURITY nor DEBUG is used
     (void)participant;
@@ -163,23 +162,8 @@ RTPSMessageGroup::RTPSMessageGroup(
     assert(participant);
     assert(endpoint);
 
-    if (!tls_group)
-    {
-        tls_group.reset(new RTPSMessageGroup_t());
-    }
-
-    uint32_t max_payload_size = participant->getMaxMessageSize();
-    const GuidPrefix_t& guid_prefix = participant->getGuid().guidPrefix;
-
-#if HAVE_SECURITY
-    tls_group->init(participant->is_secure(), max_payload_size, guid_prefix);
-#else
-    tls_group->init(max_payload_size, guid_prefix);
-#endif
-
-    full_msg_ = &(tls_group->rtpsmsg_fullmsg_);
-    submessage_msg_ = &(tls_group->rtpsmsg_submessage_);
-
+    full_msg_ = &(send_buffer_->rtpsmsg_fullmsg_);
+    submessage_msg_ = &(send_buffer_->rtpsmsg_submessage_);
 
     // Init RTPS message.
     reset_to_header();
@@ -189,7 +173,7 @@ RTPSMessageGroup::RTPSMessageGroup(
 #if HAVE_SECURITY
     if (participant->is_secure())
     {
-        encrypt_msg_ = &(tls_group->rtpsmsg_encrypt_);
+        encrypt_msg_ = &(send_buffer_->rtpsmsg_encrypt_);
         CDRMessage::initCDRMsg(encrypt_msg_);
     }
 #endif
@@ -198,6 +182,7 @@ RTPSMessageGroup::RTPSMessageGroup(
 RTPSMessageGroup::~RTPSMessageGroup() noexcept(false)
 {
     send();
+    participant_->return_send_buffer(std::move(send_buffer_));
 }
 
 void RTPSMessageGroup::reset_to_header()
