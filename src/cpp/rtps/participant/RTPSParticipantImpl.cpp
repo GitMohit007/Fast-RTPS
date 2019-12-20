@@ -237,11 +237,17 @@ RTPSParticipantImpl::RTPSParticipantImpl(
     createReceiverResources(m_att.defaultUnicastLocatorList, true);
     createReceiverResources(m_att.defaultMulticastLocatorList, true);
 
-    // Three buffers (user, events and async writer threads)
-    size_t num_send_buffers = 3;
-    // Add one buffer per reception thread
-    num_send_buffers += m_receiverResourcelist.size();
-    // Reserve buffer pool
+    bool allow_growing_buffers = m_att.allocation.send_buffers.dynamic;
+    size_t num_send_buffers = m_att.allocation.send_buffers.preallocated_number;
+    if(num_send_buffers == 0)
+    {
+        // Three buffers (user, events and async writer threads)
+        num_send_buffers = 3;
+        // Add one buffer per reception thread
+        num_send_buffers += m_receiverResourcelist.size();
+    }
+
+    // Create buffer pool
     send_buffers_.reset(new SendBuffersManager(num_send_buffers, true));
 
 #if HAVE_SECURITY
@@ -255,6 +261,7 @@ RTPSParticipantImpl::RTPSParticipantImpl(
     }
 #endif
 
+    // Allocate all pending send buffers
     send_buffers_->init(this);
 
     mp_builtinProtocols = new BuiltinProtocols();
